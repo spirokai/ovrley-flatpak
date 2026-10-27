@@ -12,7 +12,7 @@ Updates then arrive through `flatpak update` or your software centre. The `.flat
 
 ## How it works
 
-`.github/workflows/publish.yml` checks OVRLEY's releases every six hours (or on demand from the Actions tab). When the newest published release carries a newer `OVRLEY-linux-*.flatpak` than the live repository, it imports that bundle into a fresh OSTree repository, signs it and deploys it to GitHub Pages.
+`.github/workflows/publish.yml` checks OVRLEY's releases every hour (or on demand from the Actions tab). When the newest published release carries a newer `OVRLEY-linux-*.flatpak` than the live repository, it imports that bundle into a fresh OSTree repository, signs it and deploys it to GitHub Pages.
 
 The repository is signed with the key in `ovrley-flatpak.gpg`:
 

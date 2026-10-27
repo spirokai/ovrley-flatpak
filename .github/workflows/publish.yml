@@ -2,7 +2,7 @@ name: Publish Flatpak repository
 
 on:
   schedule:
-    - cron: '23 */6 * * *'
+    - cron: '23 * * * *'
   workflow_dispatch:
     inputs:
       force:
