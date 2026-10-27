@@ -1,0 +1,165 @@
+name: Publish Flatpak repository
+
+on:
+  schedule:
+    - cron: '23 */6 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Republish even if the newest release is already live
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+env:
+  APP_ID: cc.ovrley.OVRLEY
+  SOURCE_REPO: spirokai/OVRLEY
+  SITE_URL: https://flatpak.ovrley.cc/
+  GPG_FINGERPRINT: B427292B9F13708C4CE14EBEDD3BB8CE23CDB95C
+
+jobs:
+  check:
+    name: Find newest Flatpak release
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.find.outputs.publish }}
+      tag: ${{ steps.find.outputs.tag }}
+      asset: ${{ steps.find.outputs.asset }}
+
+    steps:
+      - name: Compare newest release with the live repository
+        id: find
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          FORCE: ${{ inputs.force || false }}
+        run: |
+          set -euo pipefail
+          # Newest published, non-prerelease release that carries a bundle
+          release="$(gh api "repos/$SOURCE_REPO/releases?per_page=30" --jq '
+            [.[] | select(.draft == false and .prerelease == false)
+                 | {tag: .tag_name, asset: ([.assets[].name | select(test("^OVRLEY-linux-.*\\.flatpak$"))][0])}
+                 | select(.asset != null)][0] // empty')"
+          if [ -z "$release" ]; then
+            echo "No published release carries a Flatpak bundle yet."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          tag="$(jq -r .tag <<< "$release")"
+          asset="$(jq -r .asset <<< "$release")"
+          live="$(curl -fsS --max-time 20 "${SITE_URL}version.txt" || true)"
+          echo "Newest release: $tag ($asset). Live: ${live:-none}."
+          if [ "$live" = "$tag" ] && [ "$FORCE" != "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+
+  publish:
+    name: Build and deploy repository
+    needs: check
+    if: needs.check.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Flatpak tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends flatpak ostree
+
+      - name: Import signing key
+        shell: bash
+        env:
+          FLATPAK_GPG_PRIVATE_KEY: ${{ secrets.FLATPAK_GPG_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "$FLATPAK_GPG_PRIVATE_KEY" ]; then
+            echo "The FLATPAK_GPG_PRIVATE_KEY secret is not set." >&2
+            exit 1
+          fi
+          export GNUPGHOME="$RUNNER_TEMP/flatpak-gnupg"
+          mkdir -m 700 "$GNUPGHOME"
+          echo "$FLATPAK_GPG_PRIVATE_KEY" | gpg --batch --import
+          # Clients trust the committed public key, so the secret must be its private half.
+          gpg --list-secret-keys "$GPG_FINGERPRINT" > /dev/null
+          echo "GNUPGHOME=$GNUPGHOME" >> "$GITHUB_ENV"
+
+      - name: Download bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.check.outputs.tag }}
+          ASSET: ${{ needs.check.outputs.asset }}
+        run: gh release download "$TAG" --repo "$SOURCE_REPO" --pattern "$ASSET" --output bundle.flatpak
+
+      - name: Build repository
+        shell: bash
+        env:
+          TAG: ${{ needs.check.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # Rebuilt from the newest bundle each time; clients only fetch objects that changed.
+          ostree init --mode=archive-z2 --repo=site
+          flatpak build-import-bundle --no-update-summary \
+            --gpg-sign="$GPG_FINGERPRINT" --gpg-homedir="$GNUPGHOME" site bundle.flatpak
+          flatpak build-update-repo --title=OVRLEY --generate-static-deltas \
+            --gpg-sign="$GPG_FINGERPRINT" --gpg-homedir="$GNUPGHOME" site
+          rm -rf site/tmp/*
+
+          gpg_key="$(base64 -w0 ovrley-flatpak.gpg)"
+          cat > site/ovrley.flatpakref << EOF
+          [Flatpak Ref]
+          Title=OVRLEY
+          Name=$APP_ID
+          Branch=master
+          Url=$SITE_URL
+          SuggestRemoteName=ovrley
+          Homepage=https://www.ovrley.cc
+          RuntimeRepo=https://dl.flathub.org/repo/flathub.flatpakrepo
+          IsRuntime=false
+          GPGKey=$gpg_key
+          EOF
+          cat > site/ovrley.flatpakrepo << EOF
+          [Flatpak Repo]
+          Title=OVRLEY
+          Url=$SITE_URL
+          Homepage=https://www.ovrley.cc
+          Comment=Official OVRLEY Flatpak repository
+          GPGKey=$gpg_key
+          EOF
+          printf '%s' "$TAG" > site/version.txt
+
+      - name: Check the repository verifies
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Same signature checks a client runs: summary on remote-ls, commit on remote-info.
+          flatpak remote-add --user --gpg-import=ovrley-flatpak.gpg verify "file://$PWD/site"
+          flatpak remote-ls --user verify
+          flatpak remote-info --user verify "$APP_ID"
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+      - name: Deploy to GitHub Pages
+        id: deploy
+        uses: actions/deploy-pages@v5
